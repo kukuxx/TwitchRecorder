@@ -1,10 +1,11 @@
 import os
-import subprocess
 import datetime
-
 import asyncio
+
 import aiohttp
 import requests
+
+from asyncio.subprocess import Process
 
 
 class TwitchRecord:
@@ -38,9 +39,9 @@ class TwitchRecord:
         self._output_dir = "downloads"
         if not os.path.exists(self._output_dir):
             os.makedirs(self._output_dir)
-        elif not os.path.exists(self.ffmpegpath):
+        if not os.path.exists(self.ffmpegpath):
             self.logger.error("FFmpeg not found; recording cannot start.")
-        elif not os.path.exists(self.streamlinkpath):
+        if not os.path.exists(self.streamlinkpath):
             self.logger.error("Streamlink not found; recording cannot start.")
 
     def stop_check(self):
@@ -53,10 +54,11 @@ class TwitchRecord:
                 async with session.post(self._token_url, timeout=15) as response:
                     response.raise_for_status()
                     data = await response.json()
-                    token = data["access_token"]
+                    new_token = data["access_token"]
                     self._token_status = True
-                    self.logger.info(f"Get Token Successful: {token}")
-                    return token
+                    self._access_token = new_token
+                    self.logger.info(f"Get Token Successful: {new_token}")
+                    return new_token
 
         except requests.exceptions.HTTPError as e:
             self._token_status = False
@@ -116,7 +118,7 @@ class TwitchRecord:
 
             while self._check:
                 if self._access_token is None or not self._token_status:
-                    self._access_token = await self.get_token()
+                    await self.get_token()
 
                 if self._token_status:
                     async with self._lock:
@@ -167,10 +169,11 @@ class TwitchRecord:
         name = self._streamername.get(channel, channel)
         filename = f"{name} - Twitch {datetime.datetime.now().strftime('%Y-%m-%d %H_%M_%S')}.mp4"
         filepath = os.path.join(self._output_dir, filename)
+        create_no_window = 0x08000000
 
         try:  # 建立錄製子進程
             self.logger.info(f"{channel} Start recording")
-            process = await asyncio.create_subprocess_exec(
+            proc: Process = await asyncio.create_subprocess_exec(
                 self.streamlinkpath,
                 "--twitch-disable-ads",
                 "--ffmpeg-ffmpeg",
@@ -179,42 +182,42 @@ class TwitchRecord:
                 "best",
                 "-o",
                 filepath,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                creationflags=create_no_window,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 text=False
             )
             async with self._lock_p:
-                self._process.append(process)
+                self._process.append(proc)
 
-            await process.wait()
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0 and stderr:
+                self.logger.error(f"Recording Error Output: {stderr.decode('utf-8')}")
+
             self.logger.info(f"{channel}:Recording Stream is Done")
 
         except Exception as e:
             self.logger.exception(f"Error: {e}")
-            if process:
-                stdout, stderr = await process.communicate()
-                if stderr:
-                    self.logger.error(f"Recording Error Output: {stderr.decode('utf-8')}")
         finally:
             async with self._lock:
                 self._channel_list.append(channel)
                 self._add = True
             async with self._lock_p:
-                self._process.remove(process)
+                if self._process:
+                    self._process.remove(proc)
 
     async def close_process(self):
         if self._process:
-            try:
-                async with self._lock_p:
-                    for process in self._process:
+            async with self._lock_p:
+                for process in self._process:
+                    try:
                         process.terminate()  # 終止 streamlink 錄製
                         await asyncio.wait_for(process.wait(), timeout=5)  # 等待進程終止
-                self.logger.info("Stop Recording")
-            except asyncio.TimeoutError:
-                process.kill()
-            except ProcessLookupError:
-                self.logger.warning("Process already exited, cannot terminate")
-                pass
-            except Exception as e:
-                self.logger.exception(f"Close Process Error: {e}")
+                        self.logger.info("Stop Recording")
+                    except asyncio.TimeoutError:
+                        process.kill()
+                    except ProcessLookupError:
+                        self.logger.warning("Process already exited, cannot terminate")
+                        pass
+                    except Exception as e:
+                        self.logger.exception(f"Close Process Error: {e}")
